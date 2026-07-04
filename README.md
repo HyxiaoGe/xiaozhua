@@ -69,9 +69,29 @@ systemctl --user restart  lark-agent      # 重启
 journalctl --user -u lark-agent -f        # 或 tail -f ~/lark-agent/agent.log
 ```
 
+## 交互卡片确认(阶段 4)
+
+写操作确认从"回消息"升级成"点按钮"。耳朵是**两路无界消费者**——`im.message.receive_v1`(消息)+
+`card.action.trigger`(卡片回调),同一 app 全局单事件总线,故两路都跑在同一进程内(避免总线冲突)。
+
+```
+写请求 → 安全闸拦下 → 发确认卡(橙,含「确认执行/取消」callback 按钮,value 带 pid)
+       → 你点按钮 → card.action.trigger 回调(action_value 原样带回 pid + token)
+       → 按 pid 匹配待确认操作 → 执行 → 凭 token 原地把卡片更新成绿「已执行」
+```
+
+- 确认卡是 Card 2.0,按钮 `behaviors:[{type:"callback"}]` 才会回调服务端。
+- 回调需在**开发者后台「事件与回调 → 回调配置」订阅 `card.action.trigger`**(`lark-cli event consume`
+  会吐一个预填深链,扫/开即订阅);未订阅时 consume 直接 `failed_precondition`,不是静默无事件。
+- 卡片更新走 `api POST /open-apis/interactive/v1/card/update`,token **30 分钟内最多 2 次**,须传**完整新卡 JSON**。
+- 回消息「确认」「取消」仍作兜底,卡片发送失败时自动退回纯文字命令清单。
+- 按钮点击者校验 `operator_id` 命中白名单;pid 不匹配(旧卡/已处理)→ 卡片更新为「已失效」。
+
 ## 已知局限
 
 - 排队中(还没开始处理)的消息在进程重启时会丢——事件是瞬时的,不重投给新进程。
+- 用"回消息确认/取消"或岔开话题放弃待确认时,之前那张确认卡的按钮仍留着——再点会得到「已失效」
+  (无回调 token 无法主动改旧卡),不影响正确性。
 - 极端崩溃时序下宁可保守:确认后崩溃 → 操作可能没执行(重新说一遍即可),绝不会重复执行。
 - 停进程用 SIGTERM(systemd stop 已是 SIGTERM),**别 kill -9**(会泄漏 lark-cli 服务端订阅)。
 - **启动竞态**:`event consume` 冷启动时偶发 exit code=2(bus daemon 初始化未就绪),
@@ -88,9 +108,9 @@ journalctl --user -u lark-agent -f        # 或 tail -f ~/lark-agent/agent.log
 | 1. 生态之手 | 给小爪一个受控执行 lark-cli 的工具:**读操作放行,写操作"预览→飞书里确认→带 --yes 执行"**(复用 CLI 自带的 dry-run / exit-10 安全协议)。同步验证 user 身份调用 + token 续期(生态大半在 user 身份下,2h 过期是常驻的命门) | "明天有什么安排" / "把这段记进实践手记" / "台账里昨天几条 critical",一句话跑通 |
 | 2. 站稳 | 无界 consume 流式消费(消除漏消息缝隙)、SQLite 持久记忆、断线自愈 | 连跑 72h 不漏、不崩、重启不失忆 |
 | 3. 搬家上 dev ✅ | ~~bot 登录态无头迁移~~(重新设备码授权,token 不绑机)、~~docker 化~~→**systemd user service** 钉版 lark-cli 1.0.65、litellm 直连(免隧道);租户问题 phase 3 不涉及(仍用 claude-cli 个人应用),留待 phase 5/6 | ✅ Mac 关机小爪照跑;崩溃 systemd 5s 自愈实测 |
-| 4. 卡片 | 交互卡片 + card.action.trigger 回调实测;写操作确认从"回消息"升级成"点按钮" | 点卡片按钮,小爪收到回调并执行 |
+| 4. 卡片 ✅ | 交互卡片 + card.action.trigger 回调实测;写操作确认从"回消息"升级成"点按钮"(回消息仍作兜底) | ✅ 生产真实点击跑通:写请求→安全闸→确认卡→点按钮→执行→绿卡 |
 | 5. 试点 | 接管一条非关键链路(巡检日报),与 openClaw 并行灰度一个月 | 一个月零事故 |
 | 6. 接管 | 层2恢复审批卡双发灰度 → 切换 → openClaw 下线 | 生产闭环在小爪上稳定运行 |
 
 依赖:1、2 可并行;3 在 4 前(卡片要在常驻环境测);5、6 串行。
-最大不确定性:~~user token 续期(阶段1)~~已证、~~登录态迁移(阶段3)~~已证(文件化+重授权)、卡片回调实测(阶段4)、租户迁移(阶段5/6 接管 openClaw 时)。
+最大不确定性:~~user token 续期(阶段1)~~已证、~~登录态迁移(阶段3)~~已证(文件化+重授权)、~~卡片回调实测(阶段4)~~已证(生产真实点击)、租户迁移(阶段5/6 接管 openClaw 时)。

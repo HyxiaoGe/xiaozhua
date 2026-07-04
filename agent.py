@@ -211,33 +211,45 @@ def build_system(model):
     )
 
 
-# ── 耳朵:无界监听(常驻子进程 + 队列)──────────────────────────────────
+# ── 耳朵:无界监听(每个事件源一个常驻子进程,共用一个队列)────────────────
+# 消息 + 卡片按钮回调分别是独立的 EventKey,event consume 一次只订阅一个,
+# 故每个 key 起一条看门狗线程;事件自带 type 字段,主循环据此分派。
+EVENT_KEYS = ('im.message.receive_v1', 'card.action.trigger')
+
+
 class Ear:
-    def __init__(self, q):
+    def __init__(self, q, keys=EVENT_KEYS):
         self.q = q
+        self.keys = keys
         self.stop = threading.Event()
-        self.proc = None
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.procs = {}  # event_key -> Popen
+        self.threads = [threading.Thread(target=self._loop, args=(k,), daemon=True)
+                        for k in keys]
 
     def start(self):
-        self.thread.start()
+        for th in self.threads:
+            th.start()
 
-    def _loop(self):
+    def alive(self):
+        return sum(1 for th in self.threads if th.is_alive())
+
+    def _loop(self, key):
         backoff = 2
         while not self.stop.is_set():
             try:
                 # stdin 必须挂着:无界 consume 收到 stdin EOF 会优雅退出
                 # errors='replace':stderr 混入非 UTF-8 字节时解码不抛异常
-                self.proc = subprocess.Popen(
-                    ['lark-cli', 'event', 'consume', 'im.message.receive_v1', '--as', 'bot'],
+                proc = subprocess.Popen(
+                    ['lark-cli', 'event', 'consume', key, '--as', 'bot'],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, text=True, errors='replace',
                     env=CLI_ENV)
-                print(f'[ear] 监听进程启动 pid={self.proc.pid}', flush=True)
-                for line in self.proc.stdout:
+                self.procs[key] = proc
+                print(f'[ear:{key}] 监听进程启动 pid={proc.pid}', flush=True)
+                for line in proc.stdout:
                     line = line.strip()
                     if 'websocket: connected' in line:
-                        print('[ear] WebSocket 已连接', flush=True)
+                        print(f'[ear:{key}] WebSocket 已连接', flush=True)
                         backoff = 2
                     if not line.startswith('{'):
                         continue
@@ -245,25 +257,27 @@ class Ear:
                         d = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if d.get('type') == 'im.message.receive_v1':
+                    if d.get('type') == key:
                         self.q.put(d)
             except Exception as e:  # 耳朵线程绝不能死:任何异常都走重启
-                print(f'[ear] 异常: {e!r}', flush=True)
+                print(f'[ear:{key}] 异常: {e!r}', flush=True)
             if self.stop.is_set():
                 break
-            code = self.proc.poll() if self.proc else '?'
-            print(f'[ear] 监听进程退出(code={code}),{backoff}s 后重启', flush=True)
+            proc = self.procs.get(key)
+            code = proc.poll() if proc else '?'
+            print(f'[ear:{key}] 监听进程退出(code={code}),{backoff}s 后重启', flush=True)
             self.stop.wait(backoff)
             backoff = min(backoff * 2, 60)
 
     def shutdown(self):
         self.stop.set()
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()  # SIGTERM,避免泄漏服务端订阅
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                print('[ear] 监听进程未按时退出', flush=True)
+        for key, proc in self.procs.items():
+            if proc and proc.poll() is None:
+                proc.terminate()  # SIGTERM,避免泄漏服务端订阅
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print(f'[ear:{key}] 监听进程未按时退出', flush=True)
 
 
 def reply(message_id, text):
@@ -274,6 +288,77 @@ def reply(message_id, text):
             capture_output=True, text=True, env=CLI_ENV, timeout=60)
     except subprocess.TimeoutExpired:
         print('[mouth] 回复超时', flush=True)
+
+
+# ── 交互卡片:写确认从"回消息"升级成"点按钮"─────────────────────────────
+# 发确认卡(两个 callback 按钮,value 带 pid)→ 点击触发 card.action.trigger
+# → 主循环凭 pid 匹配 pending → 执行/取消 → 用 token 原地更新卡片。
+def build_confirm_card(preview, pid, title='待确认:写操作'):
+    """预览 + 确认/取消两个 callback 按钮。Card 2.0。value 会原样回传到 action_value。"""
+    def btn(text, act, kind):
+        return {'tag': 'button', 'text': {'tag': 'plain_text', 'content': text},
+                'type': kind, 'width': 'fill',
+                'behaviors': [{'type': 'callback', 'value': {'act': act, 'pid': pid}}]}
+    return {
+        'schema': '2.0',
+        'config': {'width_mode': 'default'},
+        'header': {'title': {'tag': 'plain_text', 'content': f'⏳ {title}'},
+                   'template': 'orange'},
+        'body': {'elements': [
+            {'tag': 'markdown', 'content': preview},
+            {'tag': 'column_set', 'horizontal_spacing': 'default', 'columns': [
+                {'tag': 'column', 'width': 'weighted', 'weight': 1,
+                 'elements': [btn('✅ 确认执行', 'confirm', 'primary_filled')]},
+                {'tag': 'column', 'width': 'weighted', 'weight': 1,
+                 'elements': [btn('取消', 'cancel', 'default')]},
+            ]},
+        ]},
+    }
+
+
+def build_result_card(title, template, body_md):
+    """无按钮的结果卡:执行完/取消后原地替换确认卡。"""
+    return {
+        'schema': '2.0',
+        'config': {'width_mode': 'default'},
+        'header': {'title': {'tag': 'plain_text', 'content': title}, 'template': template},
+        'body': {'elements': [{'tag': 'markdown', 'content': (body_md or '(无输出)')[:2000]}]},
+    }
+
+
+def confirm_preview(items):
+    lines = [f'{i}. `lark-cli {a[:160]}`' for i, a in enumerate(items, 1)]
+    return (f'小爪准备执行 **{len(items)}** 条写操作:\n\n' + '\n'.join(lines)
+            + '\n\n确认后才真正执行 👇')
+
+
+def send_card(user_id, card):
+    """给指定用户私聊发一张交互卡片,返回 message_id(失败返回 None)。"""
+    payload = json.dumps(card, ensure_ascii=False)
+    try:
+        code, out = run_cli(['im', '+messages-send', '--as', 'bot', '--user-id', user_id,
+                             '--msg-type', 'interactive', '--content', payload], timeout=60)
+        d = json.loads(out) if out.startswith('{') else {}
+        if d.get('ok'):
+            return (d.get('data') or {}).get('message_id')
+        print(f'[card] 发送失败: {out[:200]}', flush=True)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        print(f'[card] 发送异常: {e!r}', flush=True)
+    return None
+
+
+def update_card(token, card):
+    """凭回调 token 原地更新卡片(30 分钟有效、最多 2 次)。需完整新卡 JSON。"""
+    if not token:
+        return
+    data = json.dumps({'token': token, 'card': card}, ensure_ascii=False)
+    try:
+        code, out = run_cli(['api', 'POST', '/open-apis/interactive/v1/card/update',
+                             '--as', 'bot', '--data', data], timeout=60)
+        if code != 0 or (out.startswith('{') and not json.loads(out).get('ok', True)):
+            print(f'[card] 更新失败(code={code}): {out[:200]}', flush=True)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        print(f'[card] 更新异常: {e!r}', flush=True)
 
 
 # ── 工具循环 ──────────────────────────────────────────────────────────
@@ -349,6 +434,41 @@ def execute_pending(pending):
     return '\n\n'.join(outs)
 
 
+def handle_card_action(con, ev, only_sender):
+    """处理卡片按钮回调:校验点击者→凭 pid 匹配 pending→执行/取消→更新卡片。
+    返回落进记忆的 note(或 None 表示不改变对话状态)。DB 里的 pending 由本函数清理。"""
+    op = ev.get('operator_id')
+    if only_sender and op != only_sender:
+        print(f'[card] 忽略非白名单点击 {op}', flush=True)
+        return None
+    token = ev.get('token')
+    try:
+        av = json.loads(ev.get('action_value') or '{}')
+    except (json.JSONDecodeError, TypeError):
+        av = {}
+    act, pid = av.get('act'), av.get('pid')
+    pending = db_kv_get(con, 'pending')
+    if not pending or pending.get('pid') != pid:  # 已处理过 / 被新操作顶替
+        update_card(token, build_result_card(
+            '⚠️ 已失效', 'grey', '这张确认卡已处理过,或被更新的操作取代了。'))
+        return None
+    if act == 'cancel':
+        db_kv_set(con, 'pending', None)
+        update_card(token, build_result_card('已取消', 'grey', '好,啥也没动。'))
+        return '(卡片:点了取消,未执行)'
+    if act == 'confirm':
+        db_kv_set(con, 'pending', None)  # 先清后执行:崩溃宁漏勿重
+        if time.time() - pending.get('ts', 0) > PENDING_TTL:
+            update_card(token, build_result_card(
+                '⌛ 已过期', 'grey', '这操作放太久作废了,需要就重新说一遍。'))
+            return '(卡片:确认时已过期,未执行)'
+        result = execute_pending(pending)
+        update_card(token, build_result_card('✅ 已执行', 'green', result))
+        return f'(卡片:点了确认,已执行)\n{result}'
+    update_card(token, build_result_card('❓', 'grey', '这个按钮我不认识。'))
+    return None
+
+
 # ── 主循环 ────────────────────────────────────────────────────────────
 def load_dotenv(path):
     if not os.path.exists(path):
@@ -407,8 +527,9 @@ def main():
     deadline = time.time() + args.minutes * 60 if args.minutes else None
     handled = 0
     last_hb = time.time()
-    print(f"[agent] 小爪上线 v3(model={cfg['model']},窗口={args.minutes or '∞'}min,"
-          f"记忆={len(history)}条,待确认={'有' if pending else '无'})", flush=True)
+    print(f"[agent] 小爪上线 v4·卡片(model={cfg['model']},窗口={args.minutes or '∞'}min,"
+          f"耳朵={len(EVENT_KEYS)}路,记忆={len(history)}条,待确认={'有' if pending else '无'})",
+          flush=True)
     try:
         while True:
             if args.max_msgs and handled >= args.max_msgs:
@@ -416,13 +537,39 @@ def main():
             if deadline and time.time() >= deadline:
                 break
             if time.time() - last_hb > 3600:
-                print(f'[hb] alive,已处理 {handled} 条,耳朵{"存活" if ear.thread.is_alive() else "已死"}',
+                print(f'[hb] alive,已处理 {handled} 条,耳朵存活 {ear.alive()}/{len(EVENT_KEYS)}',
                       flush=True)
                 last_hb = time.time()
             try:
                 ev = q.get(timeout=30)
             except queue.Empty:
                 continue
+
+            # ── 卡片按钮回调:先于消息路径分派(它没有 sender_id/message_id 语义)──
+            if ev.get('type') == 'card.action.trigger':
+                print(f"[card] 回调 tag={ev.get('action_tag')} "
+                      f"val={ev.get('action_value')!r} op={ev.get('operator_id')} "
+                      f"token={'有' if ev.get('token') else '无'}", flush=True)
+                eid = ev.get('event_id')
+                if eid and db_seen_check(con, eid):
+                    print('[card] 跳过重投递', flush=True)
+                    continue
+                t0 = time.time()
+                try:
+                    note = handle_card_action(con, ev, args.only_sender)
+                except Exception as e:
+                    print(f'[card] 处理异常: {e!r}', flush=True)
+                    note = None
+                if eid:
+                    db_seen_mark(con, eid)
+                pending = db_kv_get(con, 'pending')  # 回调清了 DB,本地副本同步
+                if note:
+                    db_remember(con, 'assistant', note)
+                    history = (history + [{'role': 'assistant', 'content': note}])[-12:]
+                    handled += 1
+                    print(f'[card] 已处理({time.time() - t0:.1f}s): {note[:80]}', flush=True)
+                continue
+
             if args.only_sender and ev.get('sender_id') != args.only_sender:
                 print(f'[agent] 忽略非白名单发送者 {ev.get("sender_id")}', flush=True)
                 continue
@@ -465,10 +612,20 @@ def main():
                         db_kv_set(con, 'pending', None)
                     answer, pending = handle_turn(cfg, history, text)
                     if pending:
-                        cmds = '\n'.join(f'{i}. lark-cli {a}'
-                                         for i, a in enumerate(pending['items'], 1))
-                        answer += ('\n\n⏸ 待确认命令(仅回「确认」二字执行全部,回「取消」放弃):\n'
-                                   + cmds)
+                        pending['pid'] = f'p{int(time.time() * 1000)}'
+                        sender = ev.get('sender_id')
+                        card_mid = send_card(
+                            sender, build_confirm_card(
+                                confirm_preview(pending['items']), pending['pid'])
+                        ) if sender else None
+                        pending['card_mid'] = card_mid
+                        if card_mid:  # 卡片发出:主渠道是点按钮,回消息仍作兜底
+                            answer += '\n\n⏸ 见下方确认卡,点「确认执行 / 取消」;也可直接回「确认」「取消」。'
+                        else:  # 卡片没发出(如回调未配置)→ 退回纯文字清单
+                            cmds = '\n'.join(f'{i}. lark-cli {a}'
+                                             for i, a in enumerate(pending['items'], 1))
+                            answer += ('\n\n⏸ 待确认命令(回「确认」执行全部,回「取消」放弃):\n'
+                                       + cmds)
                     db_kv_set(con, 'pending', pending)
                     db_remember(con, 'user', text)
                     db_remember(con, 'assistant', answer)
