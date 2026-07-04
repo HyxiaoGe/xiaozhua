@@ -1,0 +1,24 @@
+[Unit]
+Description=lark-agent (飞书生态对话入口)
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=%h/lark-agent/run.sh
+WorkingDirectory=%h/lark-agent
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+SuccessExitStatus=0 143
+Environment=TMPDIR=/tmp
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=append:%h/lark-agent/agent.log
+StandardError=append:%h/lark-agent/agent.log
+
+[Install]
+WantedBy=default.target

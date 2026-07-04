@@ -1,0 +1,8 @@
+.env
+assets.local.md
+__pycache__/
+*.pyc
+.DS_Store
+memory.db
+.agent.lock
+agent.log
